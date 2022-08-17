@@ -1,0 +1,1210 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Dec 17 17:28:25 2020
+
+@author: skibbe
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.multiprocessing as mp
+#mp.set_start_method('spawn')
+#from collections import OrderedDict
+
+import random
+import matplotlib.pyplot as plt
+#import torch.optim as optim
+import math
+from . import tools as tls
+import scipy
+import pw
+from typing import Dict, Tuple, Sequence, List
+
+
+class patchwriter():
+    @staticmethod
+    def non_linear_def(shape,spacing=30,factor=[5],img_element_size=1.0,device="cpu"):
+            dim = len(shape)
+            shape_t = shape#.to(device=device)
+            #noise_shape = (shape_t/(spacing*img_element_size)).int()
+            img_element_size_t = torch.tensor(img_element_size,device=device).flip(dims=(0,))
+            noise_shape = (shape_t/(spacing/img_element_size_t)).int()
+            #noise_shape = (shape_t/(spacing)).int()
+            
+            
+            
+            d_xyz = 0.5/shape_t
+            
+            factor = tls.tt(factor,device=device).flip(dims=(0,))
+            nf = factor * spacing/img_element_size_t
+            #print("nf {}".format(nf))
+            if dim==2:
+                n_weight = torch.zeros([1,dim,1,1],device=device);
+                n_weight[0,:,0,0] = d_xyz * nf
+            else:
+                n_weight = torch.zeros([1,dim,1,1,1],device=device);
+                n_weight[0,:,0,0,0] = d_xyz * nf
+                 
+            
+            gshape = (1,dim,)+(noise_shape[0],noise_shape[1])
+            if dim == 3:
+                gshape = (1,dim,)+(noise_shape[0],noise_shape[1],noise_shape[2])
+            noise_grid = torch.randn(gshape,dtype = torch.float32,device=device)
+            
+            noise_grid*=n_weight
+            
+                
+            if dim==2:
+                noise_grid[0,0,:,0] = 0
+                noise_grid[0,0,:,-1] = 0
+                noise_grid[0,1,0,:] = 0
+                noise_grid[0,1,-1,:] = 0
+            else:
+                noise_grid[0,0,:,:,0] = 0
+                noise_grid[0,0,:,:,-1] = 0
+                noise_grid[0,1,:,0,:] = 0
+                noise_grid[0,1,:,-1,:] = 0
+                noise_grid[0,2,0,:,:] = 0
+                noise_grid[0,2,-1,:,:] = 0
+            if True:
+                if dim == 3:
+                        smooth_dim = tls.tt([1.0,1.0,1.0],device="cpu") * (tls.tt(factor,device="cpu") >0)
+                        #smooth_dim[:] = 0
+                        #print(smooth_dim)
+                        kernel = torch.cat((pw.g_kernels[dim][5][2][None,None,:,:,:]*smooth_dim[0],
+                                            pw.g_kernels[dim][5][2][None,None,:,:,:]*smooth_dim[1],
+                                            pw.g_kernels[dim][5][2][None,None,:,:,:]*smooth_dim[2]),dim=0).to(device=device)
+                        
+                        noise_grid = torch.nn.functional.conv3d(noise_grid,kernel,padding=2,groups=dim)
+        
+                else:
+                        kernel = torch.cat((pw.g_kernels[dim][5][2][None,None,:,:],pw.g_kernels[dim][5][2][None,None,:,:]),dim=0).to(device=device)
+                        noise_grid = torch.nn.functional.conv2d(noise_grid,kernel,padding=2,groups=dim)
+                
+            
+            if dim==2:
+                noise_grid[0,0,:,0] = 0
+                noise_grid[0,0,:,-1] = 0
+                noise_grid[0,1,0,:] = 0
+                noise_grid[0,1,-1,:] = 0
+            else:
+                noise_grid[0,0,:,:,0] = 0
+                noise_grid[0,0,:,:,-1] = 0
+                noise_grid[0,1,:,0,:] = 0
+                noise_grid[0,1,:,-1,:] = 0
+                noise_grid[0,2,0,:,:] = 0
+                noise_grid[0,2,-1,:,:] = 0
+            return noise_grid#.to(device="cpu")
+        
+    @staticmethod
+    def pyramidal_shifts(base_scale_indx,
+                             scale_facts,
+                             img_pyramid,
+                             trans_mat,
+                             trans_inv_mat,
+                             trafo,
+                             #rot_mat,
+                             grid_bb,
+                             scale,
+                             bb_img_0,
+                             bb_img_1,
+                             mode = "random",
+                             device="cpu",
+                             ):
+            n_scales = scale_facts.shape[1]#len(scale_facts)
+            scales = range(n_scales)
+        
+            offsets = {}
+            init = True        
+            #make sure base scale image comes first
+            for s in [base_scale_indx]+list(reversed(scales)) :
+                if s < base_scale_indx:
+                    continue
+                if s == base_scale_indx:
+                    if init:
+                        init = False
+                    else:
+                        continue
+                best_img = min(max(0,round(s*np.min(scale))),max(scales)) 
+                
+                dim = img_pyramid.dim
+                #compute bounding box
+                if dim == 2:
+                    res_mat = torch.tensor([[scale_facts[1,s],0,0],[0,scale_facts[0,s],0],[0,0,1]],dtype = torch.float32,device=device)
+                else:
+                    res_mat = torch.tensor([[scale_facts[2,s],0,0,0],
+                                                    [0,scale_facts[1,s],0,0],
+                                                    [0,0,scale_facts[0,s],0],
+                                                    [0,0,0,1]],dtype = torch.float32,device=device)    
+                mat = torch.mm(trans_inv_mat,res_mat)
+                mat = torch.mm(mat,trafo)#torch.mm(mat,trafo,out=mat)
+                mat = torch.mm(mat,trans_mat)
+                grid_bb_ = torch.matmul(grid_bb,mat).clone()
+                     
+                grid_0 = grid_bb_[0,:dim]
+                grid_1 = grid_bb_[-1,:dim]
+                 
+                offset = torch.zeros(dim,device=device)
+                
+                #initialize patch in full resolution
+                if s == base_scale_indx:
+                    #image boundaries
+                    if False:
+                        if dim == 2:
+                            bb_img_0 = torch.tensor([-1.0,-1.0],device=device) 
+                            bb_img_1 = torch.tensor([1.0,1.0],device=device)  
+                        else:
+                            bb_img_0 = torch.tensor([-1.0,-1.0,-1.0],device=device) 
+                            bb_img_1 = torch.tensor([1.0,1.0,1.0],device=device)  
+
+                    #bb of patch in full res
+                    bb_inner_0 = grid_bb_[0,:dim].clone()
+                    bb_inner_1 = grid_bb_[-1,:dim].clone()
+                                        
+                    #bb of next (higher/coarser) scale patch
+                    #-> at the beginning, img bb
+                    bb_outer_0 = bb_img_0.clone()
+                    bb_outer_1 = bb_img_1.clone()
+                    
+                else:
+                    bb_corrections = True
+                    #align img top/left with inner patch bb t/l
+                    offset = bb_inner_0 - grid_0
+                   
+                    if bb_corrections:
+                        #correct if bb is out of image bottom/right
+                        overshoot = torch.clamp((grid_1 + offset) - bb_outer_1,min=0)
+                        offset -= overshoot
+                    else:
+                        overshoot  = 0
+             
+                    #compute valid margin between inner/outer bb
+                    margin_best = ( (grid_1-grid_0) - (bb_inner_1-bb_inner_0)-overshoot)
+                    margin_constraint =       (grid_0+offset -bb_outer_0)
+                    margin = torch.min(margin_best,margin_constraint)
+                    offset -= margin * (torch.rand(dim,device=device) if mode == "random" else 0.5) 
+                    
+                    #correct if bb is out of image (if possible)
+                    if bb_corrections:
+                        clamp_left = torch.clamp(bb_img_0 - (grid_0 + offset),min=0)
+                        clamp_right = torch.clamp((grid_1 +  offset) - (bb_img_1 ),min=0)
+                        
+                        clamp_right[clamp_left>0] = 0
+                        offset += clamp_left - clamp_right 
+                    
+                    #set next outer bb to current inner bb
+                    bb_outer_0 = grid_0 + offset
+                    bb_outer_1 = grid_1 + offset 
+                
+                #print("offset: {} : {}".format(s,offset))
+                offsets[s] = offset.clone()
+            return offsets    
+        
+    @staticmethod 
+    def write_patch_static(
+                    img_pyramid_list,
+                    batch_list_list,
+                    batch_id,
+                    position,
+                    scale_facts,
+                    base_scale_indx=None,
+                    scale = (1,1,1),
+                    rotate=0,
+                    mode = "random",
+                    interpolation=["bilinear","nearest"],#interpolation=["bilinear","nearest"],
+                    non_linear_def_spacing=30,
+                    non_linear_def_factor=[0],
+                    scale_whitelist=[],
+                    spatial_noise=[0],
+                    intensity_noise=None,
+                    device="cpu",
+                    target_device="cpu",
+                    force_nonlin_def=False,
+                    target_element_size=None,
+                    ref_point = "tl",#ref_point = "center",
+                    warn_if_ooim=False,
+                    crop_bb = False,#):
+                    correct_ooim_level0=False):
+        
+        
+        #print("new write patch 2")
+        def abs2rel(pos,shape):
+            return 2.0 * ((pos)/(shape-1) - 0.5) 
+        
+    
+    
+        
+                    
+        #list of output batches
+        batch_list = batch_list_list[0]
+        #list of input images (usually img and label)
+        pfield = batch_list.patchlist[0].tensor.shape[2:]
+    
+        #reference img pyramid
+        #we assume all have same attributes (img sizes etc.)       
+        img_pyramid = img_pyramid_list[0]
+        
+        if crop_bb:
+            crop_bb = img_pyramid.bb
+        
+        n_scales = scale_facts.shape[1]#len(scale_facts)
+        scales = range(n_scales)
+        #if scales is None:
+        #    scales = range(len(img_pyramid.tensors))
+        if base_scale_indx is None:
+            base_scale_indx = 0# min(scales)
+            
+            
+        t = img_pyramid.tensors[0]
+        shape = torch.tensor(t.shape,device=device)
+        shape_t = shape[2:].float()
+        
+        #pfield_scale = 1
+        if False:
+            if target_element_size is not None:
+                img_element_size = img_pyramid.element_size
+                #target_element_size_t = target_element_size if type(target_element_size) == torch.Tensor else torch.tensor(target_element_size) 
+                #img_element_size_t = img_element_size if type(img_element_size) == torch.Tensor else torch.tensor(img_element_size) 
+                #pfield_scale = target_element_size_t/img_element_size_t
+                scale = list(scale) 
+                for d in range(img_pyramid.dim):
+                    scale[d] *=  target_element_size[d]/img_element_size[d]
+                #scale[d] *=  img_element_size[d]/target_element_size[d]
+        
+        pfield_img_voxel_space = pfield
+        if target_element_size is not None:
+                img_element_size = img_pyramid.element_size
+                target_element_size_t = target_element_size if type(target_element_size) == torch.Tensor else torch.tensor(target_element_size) 
+                img_element_size_t = img_element_size if type(img_element_size) == torch.Tensor else torch.tensor(img_element_size) 
+                pfield_img_voxel_space =  torch.tensor(pfield) * target_element_size_t/img_element_size_t
+                
+           # print("scale :{}".format(scale))
+    
+        
+        #print("!!!! {}".format(img_pyramid.dim))
+        #print("!!!! {}".format(scale))
+        scale_t = torch.tensor(scale[:img_pyramid.dim],dtype=torch.float32,device=device)
+        
+        #scale_facts_t  = torch.tensor(scale_facts,device=device)        
+        scale_facts_t  = tls.tt(scale_facts,device=device)
+        
+                                      
+        if ref_point == "center":
+            # scaled image should have same borders than original image
+            position_offset = (scale_t-1)*torch.tensor(pfield,device=device)/2.0
+            position_scaled = position_offset + torch.tensor(position,device=device)[:img_pyramid.dim]* (shape_t-2.0*position_offset)/shape_t
+    #UP        
+            #position_t = (position_scaled + (torch.tensor(pfield,device=device) /2.0))*(2.0**base_scale) 
+         #   position_t = (position_scaled + (torch.tensor(pfield,device=device) /2.0))*(scale_facts[:,base_scale_indx]) 
+            position_t = (position_scaled + (torch.tensor(pfield,device=device) /2.0))* scale_facts_t[:,base_scale_indx]
+         
+            bb_start = torch.round(position_t)  -  (torch.tensor(pfield,device=device) /2.0)
+            #bb_end = bb_start + torch.tensor(pfield,device=device) - 1
+            bb_end = bb_start + tls.tt(pfield,device=device) - 1
+            
+        else: # ref point is top left
+            #position_t = torch.tensor(position,device=device)[:img_pyramid.dim].float()
+            position_t = tls.tt(position,device=device)[:img_pyramid.dim].float()
+         
+            #print("wtf : {}".format(position_t))
+            bb_start = position_t
+            #bb_start = torch.round(position_t)
+            #bb_end = bb_start + torch.tensor(pfield,device=device) - 1
+            #bb_end = bb_start + torch.tensor(pfield_img_voxel_space,device=device) - 1
+            bb_end = bb_start + tls.tt(pfield_img_voxel_space,device=device) - 1
+            
+            
+            #print("bb_start  :{}".format(bb_start))
+           # print("bb_end  :{}".format(bb_end))
+            #print("bb_start  :{}".format(abs2rel(bb_start,shape[2:])))
+            #print("bb_end  :{}".format(abs2rel(bb_end,shape[2:])))
+    
+        pos_rel = abs2rel((position_t).float(),shape[2:])
+        #pos_rel_scaled = pos_rel
+        #print(position_t) 
+        #print(pos_rel)
+        
+        grid = torch.ones((1,)+pfield+(img_pyramid.dim+1,),dtype = torch.float32,device=device)
+        grid_ = torch.zeros(grid.shape,dtype = torch.float32,device=device)
+    
+        #grid_distortion = torch.zeros(grid.shape,dtype = torch.float32)
+    
+        if img_pyramid.dim == 2:
+            if False:
+                dx = torch.arange(bb_start[0],bb_end[0],device=device)
+                dy = torch.arange(bb_start[1],bb_end[1],device=device)
+                grid_y, grid_x = torch.meshgrid(dx, dy)
+                
+                grid[0,:,:,0] = 2.0 * (grid_x / (float(t.shape[3]-1)) -0.5) 
+                grid[0,:,:,1] = 2.0 * (grid_y / (float(t.shape[2]-1)) -0.5) 
+            else:
+                bb_start_rel = abs2rel(bb_start,shape[2:])
+                bb_end_rel = abs2rel(bb_end,shape[2:])
+                
+                if correct_ooim_level0:
+                    for d in range(img_pyramid.dim ):
+                        correction = (bb_end_rel[d]-1).clamp(min=0)
+                        bb_start_rel[d] -= correction
+                        bb_end_rel[d] -= correction
+                        pos_rel[d] -= correction
+                        #correction = (bb_start_rel[d]+1).clamp(max=0)
+                        #bb_start_rel[d] += correction
+                        #bb_end_rel[d] += correction
+                        
+                        
+            #    correction = (grid_bb[1,:]-1).clamp(min=0)
+            #    grid-=correction
+            #    grid_bb-=correction
+    
+                dx = tls.arange_closed(bb_start_rel[0],bb_end_rel[0],pfield[0],device=device)
+                dy = tls.arange_closed(bb_start_rel[1],bb_end_rel[1],pfield[1],device=device)
+                
+                grid_y , grid_x = torch.meshgrid(dx, dy)
+                grid[0,...,0] = grid_x
+                grid[0,...,1] = grid_y
+            
+            trans_inv_mat = torch.tensor([[1,0,0],
+                                          [0,1,0],
+                                          [-pos_rel[1],-pos_rel[0],1]],dtype = torch.float32,device=device)
+            trans_mat = torch.tensor([[1,0,0],
+                                      [0,1,0],
+                                      [pos_rel[1],pos_rel[0],1]],dtype = torch.float32,device=device)
+            #if trafo is None:
+                #scale = (1,1)
+            scale_mat = torch.tensor([[scale[1],0,0],
+                                      [0,scale[0],0],
+                                      [0,0,1]],dtype = torch.float32,device=device)
+            trafo = scale_mat
+            has_rotation = False
+            if rotate!=0:
+                has_rotation = True
+                rot_mat = torch.tensor([[math.cos(rotate),math.sin(rotate),0],[-math.sin(rotate),math.cos(rotate),0],[0,0,1]],dtype = torch.float32,device=device)
+            #trafo = torch.mm(rot_mat,scale_mat)
+    
+            grid_bb = torch.cat((grid[None,0,0,0,:],grid[None,0,-1,-1,:]),dim=0)
+            
+            #if correct_ooim_level0:
+            #    correction = (grid_bb[1,:]-1).clamp(min=0)
+            #    if torch.any(correction>0):
+            #        print("ss")
+            #    grid-=correction
+            #    grid_bb-=correction
+            
+        
+        if img_pyramid.dim == 3:
+            if False:
+                dx = torch.arange(bb_start[0],bb_end[0],device=device)
+                dy = torch.arange(bb_start[1],bb_end[1],device=device)
+                dz = torch.arange(bb_start[2],bb_end[2],device=device)
+                #grid_y, grid_x , grid_z = torch.meshgrid(dx, dy, dz)
+                grid_z, grid_y , grid_x = torch.meshgrid(dx, dy, dz)
+                
+                grid[0,...,0] = 2.0 * (grid_x / (float(t.shape[4]-1)) -0.5) 
+                grid[0,...,1] = 2.0 * (grid_y / (float(t.shape[3]-1)) -0.5) 
+                grid[0,...,2] = 2.0 * (grid_z / (float(t.shape[2]-1)) -0.5) 
+            else:
+                #pfield_scale = pfield_scale0.001
+
+                bb_start_rel = abs2rel(bb_start,shape[2:])
+                bb_end_rel = abs2rel(bb_end,shape[2:])
+                
+                if True:
+                    if correct_ooim_level0:
+                        for d in range(img_pyramid.dim ):
+                            correction = (bb_end_rel[d]-1).clamp(min=0)
+                            #if (correction.abs().sum()>0):
+                            #    print("diff {}".format(t.shape[4-d]*correction/2.0))
+                            bb_start_rel[d] -= correction
+                            bb_end_rel[d] -= correction
+                            pos_rel[d] -= correction
+                        
+                dx = tls.arange_closed(bb_start_rel[0],bb_end_rel[0],pfield[0],device=device)
+                dy = tls.arange_closed(bb_start_rel[1],bb_end_rel[1],pfield[1],device=device)
+                dz = tls.arange_closed(bb_start_rel[2],bb_end_rel[2],pfield[2],device=device)
+                
+                
+                #print(" bb_start_rel: {}".format(bb_start_rel))
+                #print(" bb_end_rel: {}".format(bb_end_rel))
+                #print(" pfield: {}".format(pfield))
+                #print(" dx: {}".format(dx))
+                #print(" dy: {}".format(dy))
+                #print(" dz: {}".format(dz))
+    
+                grid_z, grid_y , grid_x = torch.meshgrid(dx, dy, dz)
+                grid[0,...,0] = grid_x
+                grid[0,...,1] = grid_y
+                grid[0,...,2] = grid_z
+                
+            
+                      
+            trans_inv_mat = torch.tensor([[1,0,0,0],
+                                          [0,1,0,0],
+                                          [0,0,1,0],
+                                          [-pos_rel[2],-pos_rel[1],-pos_rel[0],1]],dtype = torch.float32,device=device)
+            trans_mat = torch.tensor([[1,0,0,0],
+                                          [0,1,0,0],
+                                          [0,0,1,0],
+                                          [pos_rel[2],pos_rel[1],pos_rel[0],1]],dtype = torch.float32,device=device)
+            
+            scale_mat = torch.tensor([[scale[2],0,0,0],
+                                      [0,scale[1],0,0],
+                                      [0,0,scale[0],0],
+                                      [0,0,0,1]],dtype = torch.float32,device=device)
+               
+            trafo = scale_mat 
+            
+            #print("trans_inv_mat {} ".format(trans_inv_mat))
+            #print("trans_mat {} ".format(trans_mat))
+            #print("scale_mat {} ".format(scale_mat))
+            
+            has_rotation = False
+            if isinstance(rotate, torch.Tensor):
+                has_rotation = True
+                rotate/=torch.norm(rotate)
+                qr = rotate[0]
+                qi = rotate[1]
+                qj = rotate[2]
+                qk = rotate[3]
+                #print(rotate)
+                
+                rot_mat = torch.tensor([[1.0-2.0*(qj**2+qk**2),2*(qi*qj+qk*qr),  2*(qi*qk-qj*qr),  0],
+                                          [2*(qi*qj-qk*qr),     1-2*(qi**2+qk**2),2*(qj*qk+qi*qr),  0],
+                                          [2*(qi*qk+qj*qr),     2*(qj*qk-qi*qr),  1-2*(qi**2+qj**2),0],
+                                          [0,0,0,1]],dtype = torch.float32,device=device)
+                print(rot_mat)
+                print(rot_mat.det())
+        
+            grid_bb = torch.cat((grid[None,0,0,0,0,:],grid[None,0,-1,-1,-1,:]),dim=0)
+            
+        if warn_if_ooim  and (torch.any(grid_bb.abs()>1.00001)):
+            print("#W initial point ooim: {}".format(s))
+        
+        #print("grid_bb {}".format(grid_bb))
+        
+        if mode not in ["centered"]:
+            if img_pyramid.dim == 2:
+                bb_img_0 = torch.tensor([-1.0,-1.0],device=device) 
+                bb_img_1 = torch.tensor([1.0,1.0],device=device)  
+            else:
+                bb_img_0 = torch.tensor([-1.0,-1.0,-1.0],device=device) 
+                bb_img_1 = torch.tensor([1.0,1.0,1.0],device=device)  
+            if crop_bb:
+                #valid_bb = abs2rel(torch.tensor([[100,50],[55,155]]),shape_t)
+               # print(crop_bb[0].device)
+              #  print(shape_t[0].device)
+
+                bb_img_0 = abs2rel(tls.tt(crop_bb[0].to(device=device)),shape_t).flip(dims=(0,))#.to(device=device)
+                bb_img_1 = abs2rel(tls.tt(crop_bb[1].to(device=device)),shape_t).flip(dims=(0,))
+               # bb_img_0 = bb_img_0[];
+                #print("{} {}".format(bb_img_0,bb_img_1))
+                
+            shifts_ = patchwriter.pyramidal_shifts(
+                base_scale_indx,
+                scale_facts,
+                img_pyramid,
+                trans_mat,
+                trans_inv_mat,
+                scale_mat,#trafo,#scale_mat,#,
+                grid_bb,
+                scale,
+                bb_img_0,
+                bb_img_1,
+                mode = mode,device=device,#"deterministic"                
+                )
+            #print(shifts_)
+            #shifts_r = torch.ones(img_pyramid.dim+1)
+            #shifts_r[:img_pyramid.dim] = shifts_[0]
+            #shifts_r = torch.mm(rot_mat,shifts_r[:,None])
+            #print(shifts_r)
+        else:
+            print("no pyramidal_shifts")
+        
+        
+        #print("grid_bb {}".format(grid_bb))
+        if any(non_linear_def_factor) or force_nonlin_def:
+            img_element_size = None
+            if target_element_size is not None:
+                img_element_size = img_pyramid.element_size
+            
+            noise_grid = patchwriter.non_linear_def(shape=shape_t,
+                                        spacing=non_linear_def_spacing,
+                                        img_element_size=img_element_size,
+                                        factor=non_linear_def_factor,device=device)
+       # print(shifts_)
+        ref_pos = torch.zeros([img_pyramid.dim],device=device)
+        
+        
+        crop_offsets_0 = {}
+        crop_offsets_1 = {}
+        init = True  
+        #for s in list(reversed(scales)):
+        #make sure base scale image comes first
+        for s in [base_scale_indx]+list(reversed(scales)) :
+            if s < base_scale_indx:
+                continue
+            if s == base_scale_indx:
+                if not init:
+                    continue      
+                
+            if len(scale_whitelist) > 0 and not (s in scale_whitelist):
+                #print("skipping scale {} ({} | {})".format(s,base_scale,scale_whitelist))
+                continue
+            #if img_pyramid.dim == 2:
+            #best_img = min(max(0,round(s*np.mean(scale))),max(scales)) 
+            
+           # best_img = 0
+    
+            if img_pyramid.dim == 2:
+                #assert(False)
+                #res_mat = torch.tensor([[(2**s),0,0],[0,(2**s),0],[0,0,1]],dtype = torch.float32,device=device)
+                res_mat = torch.tensor([[scale_facts[1,s],0,0],[0,scale_facts[0,s],0],[0,0,1]],dtype = torch.float32,device=device)
+            else:
+                res_mat = torch.tensor([[scale_facts[2,s],0,0,0],
+                                                [0,scale_facts[1,s],0,0],
+                                                [0,0,scale_facts[0,s],0],
+                                                [0,0,0,1]],dtype = torch.float32,device=device)
+            
+                #res_mat = torch.tensor([[(2**s),0,0,0],
+                #                                [0,(2**s),0,0],
+                #                                [0,0,(2**s),0],
+                #                                [0,0,0,1]],dtype = torch.float32,device=device)
+            
+            if init:
+                init = False            
+            
+            #print("trans_inv_mat {} ".format(trans_inv_mat))
+            #print("trans_mat {} ".format(trans_mat))
+            #print("scale_mat {} ".format(scale_mat))
+            #print("res_mat {} ".format(res_mat))
+            #print("trafo {} ".format(trafo))
+            mat = torch.mm(trans_inv_mat,res_mat)
+            
+            #print("torch.mm(trans_inv_mat,res_mat) {} ".format(mat))
+            #torch.mm(mat,trafo,out=mat)
+            mat=torch.mm(mat,trafo)
+            
+            #print("torch.mm(mat,trafo,out=mat) {} ".format(mat))
+            #torch.mm(mat,trans_mat,out=mat)
+            mat = torch.mm(mat,trans_mat)
+            #print("torch.mm(mat,trans_mat,out=mat) {} ".format(mat))
+                    #torch.matmul(grid,mat,out=grid_)
+            
+            if img_pyramid.dim == 2:
+                grid_bb = torch.cat((grid[None,0,0,0,:],grid[None,0,-1,-1,:]),dim=0).clone()
+            else:
+                grid_bb = torch.cat((grid[None,0,0,0,0,:],grid[None,0,-1,-1,-1,:]),dim=0).clone()
+                
+            #print("grid_bb {} ".format(grid_bb))
+            #print("mat {} ".format(mat))
+           # if warn_if_ooim  and (torch.any(grid_bb.abs()>1.00001)):
+           #     print("#W initial point ooim: {}".format(s))            
+            grid_bb = torch.matmul(grid_bb,mat) #torch.matmul(grid_bb,mat,out=grid_bb)
+                
+            #if warn_if_ooim  and (torch.any(grid_bb.abs()>1.00001)):
+            #    print("#W I guess basescale is different: {}".format(s))            
+            #if mode not in ["centered"]:    
+                #grid_bb[...,:img_pyramid.dim] += shifts_[s] 
+                #grid_[...,:img_pyramid.dim] += shifts_[s] 
+            #print("!")
+            if has_rotation:
+                center_ = (grid_bb[1,:] - grid_bb[0,:]) / 2.0 + grid_bb[0,:]
+                center_[img_pyramid.dim] = 1
+            
+                if img_pyramid.dim==2:
+                    trans_inv_mat_rot = torch.tensor([[1,0,0],
+                                              [0,1,0],
+                                              [-center_[0],-center_[1],1]],dtype = torch.float32)
+                    trans_mat_rot = torch.tensor([[1,0,0],
+                                              [0,1,0],
+                                              [center_[0],center_[1],1]],dtype = torch.float32)
+                else:
+                    trans_inv_mat_rot = torch.tensor([[1,0,0,0],
+                                              [0,1,0,0],
+                                              [0,0,1,0],
+                                              [-center_[0],-center_[1],-center_[2],1]],dtype = torch.float32)
+                    trans_mat_rot = torch.tensor([[1,0,0,0],
+                                              [0,1,0,0],
+                                              [0,0,1,0],
+                                              [center_[0],center_[1],center_[2],1]],dtype = torch.float32)
+                    
+                if mode not in ["centered"]:    
+                    grid_bb[...,:img_pyramid.dim] += shifts_[s] 
+                    if img_pyramid.dim==2:
+                        shifts_m = torch.tensor([[1,0,0],
+                                                  [0,1,0],
+                                                  [shifts_[s][0],shifts_[s][1],1]],dtype = torch.float32,device=device)
+                    else:
+                        shifts_m =torch.tensor([[1,0,0,0],
+                                              [0,1,0,0],
+                                              [0,0,1,0],
+                                              [shifts_[s][0],shifts_[s][1],shifts_[s][2],1]],dtype = torch.float32,device=device)
+                         
+                        
+                    #torch.mm(mat,shifts_m,out=mat)
+                    mat = torch.mm(mat,shifts_m)
+    
+                #torch.mm(mat,trans_inv_mat_rot,out=mat)
+                #torch.mm(mat,rot_mat,out=mat)
+                #torch.mm(mat,trans_mat_rot,out=mat)
+                #torch.matmul(grid,mat,out=grid_)
+                mat = torch.mm(mat,trans_inv_mat_rot)
+                mat = torch.mm(mat,rot_mat)
+                mat = torch.mm(mat,trans_mat_rot)
+                grid_ = torch.matmul(grid,mat)
+                
+            else:
+                #torch.matmul(grid,mat,out=grid_)
+            
+                grid_ = torch.matmul(grid,mat)
+                if mode not in ["centered"]: 
+                    #print(" shifts_: {}".format(shifts_))
+                    #print(" wtf: {}".format( grid_bb[0,:img_pyramid.dim]))
+                    #print(" wtf: {}".format( grid_bb[1,:img_pyramid.dim]))
+                    #print(" wtf: {}".format( grid_bb))
+                    grid_bb[...,:img_pyramid.dim] += shifts_[s] 
+                    grid_[...,:img_pyramid.dim] += shifts_[s] 
+                
+            
+            grid_0 = grid_bb[0,:img_pyramid.dim]
+            grid_1 = grid_bb[1,:img_pyramid.dim]
+              
+            if warn_if_ooim  and (torch.any(grid_0<-1.001) or torch.any(grid_1>1.001)):
+                print("#W initial point ooim: {}".format(s))
+                print("#W grid_0: {}".format(grid_0))
+                print("#W grid_0 < -1: {}".format(grid_0<-1))
+                print("#W grid_1: {}".format(grid_1))         
+                print("#W grid_1 > 1: {}".format(grid_1>1))   
+                #print("#W impos 0: {}".format(shape_t*(grid_0.flip(dims=(0,))+1.0)/2.0))
+                #print("#W impos 1: {}".format(shape_t*(grid_1.flip(dims=(0,))+1.0)/2.0))
+                print("#W impos 0: {}".format((shape_t-1)*(grid_0.flip(dims=(0,))/2.0+0.5)))
+                print("#W impos 1: {}".format((shape_t-1)*(grid_1.flip(dims=(0,))/2.0+0.5)))
+    
+                print("#W shape : {}".format(shape_t))
+                
+                #2.0 * ((pos)/(shape-1) - 0.5)
+            
+            offset = torch.zeros(img_pyramid.dim)                
+            
+            crop_offsets_0[s] = grid_0.clone().to(device="cpu")
+            crop_offsets_1[s] = grid_1.clone().to(device="cpu")
+      
+    
+      
+            if any(non_linear_def_factor) or force_nonlin_def:
+                noise_grid_s =  torch.nn.functional.grid_sample(noise_grid, 
+                                                        grid_[...,:img_pyramid.dim], 
+                                                        mode="bilinear", 
+                                                        padding_mode='zeros', 
+                                                        align_corners=True)
+               # print(noise_grid_s[0,0,...].max())
+               # print(noise_grid_s[0,1,...].max())
+               # print(noise_grid_s[0,2,...].max())
+               
+                grid_[0,...,0] += noise_grid_s[0,0,...]
+                grid_[0,...,1] += noise_grid_s[0,1,...]
+                if img_pyramid.dim == 3:
+                    grid_[0,...,2] += noise_grid_s[0,2,...]
+                    
+                
+                    
+            if any(spatial_noise):# > 0:
+                    d_xyz = torch.tensor(spatial_noise,dtype=torch.float32).flip(dims=(0,))/torch.tensor(grid_.shape[1:5],dtype=torch.float32)
+                    grid_ += d_xyz * torch.randn(grid_.shape,device=device) 
+                    print("")                    
+                
+            
+            #grid_cpu = grid_.noise_grid.clamp(min=-1.0,max=1.0).to(device=target_device)
+            grid_cpu = grid_.to(device=target_device)
+            
+            for bl in range(len(batch_list_list)):
+                avaliable_scales = len(img_pyramid_list[bl].tensors)
+                #best_img = min(max(0,round(s*np.min(scale))),max(scales)) 
+                best_img = min(max(0,round(s*np.min(scale))),avaliable_scales-1) 
+                
+                t_s = img_pyramid_list[bl].tensors[best_img]
+                
+                #if warn_if_ooim and torch.any(grid_>1.001) or torch.any(grid_<-1.001):
+                #    print("#W: ooim warning")
+    
+                #rep_dims = torch.Size((t_s.shape[1],)+(1,)*(img_pyramid.dim+1))
+                patch = torch.nn.functional.grid_sample(t_s, 
+                                                        grid_cpu[...,:img_pyramid.dim], 
+                                                        mode=interpolation[bl] if isinstance(interpolation,list)  else interpolation, 
+                                                        padding_mode='zeros', 
+                                                        align_corners=True)
+                
+                if intensity_noise is not None:
+                    if intensity_noise[bl] > 0.00000001:
+                        patch = torch.clamp(patch  *(1+intensity_noise[bl] * torch.randn(patch.shape)),min=0) 
+
+                
+                batch_list_list[bl].patchlist[s].tensor[batch_id,...] = patch
+                #batch_list_list[bl].patchlist[s].offsets[batch_id,:] =   0
+                
+                batch_list_list[bl].patchlist[s].rel_coordinates[batch_id,:] = grid_cpu[...,:img_pyramid.dim]
+                
+                # not needed
+                #if s == base_scale_indx:
+                #    batch_list_list[bl].patchlist[s].grid[batch_id,...,:] = grid_cpu[...,:img_pyramid.dim]
+                batch_list_list[bl].patchlist[s].offset_rel[batch_id,:] =  crop_offsets_0[s]
+                #batch_list_list[bl].patchlist[s].offset_rel =  crop_offsets_0[s]
+                
+    
+
+        for s in range(1+base_scale_indx,max(scales)+1):   
+            
+            if len(scale_whitelist) > 0 and not ((s in scale_whitelist) and ((s-1) in scale_whitelist)):
+                #print("skipping scale {}".format(s))
+                continue
+            
+            src_size = crop_offsets_1[s] - crop_offsets_0[s]            
+            start_ = ((crop_offsets_0[s-1] - crop_offsets_0[s]) / src_size - 0.5) * 2.0 
+            end_ = ((crop_offsets_1[s-1] - crop_offsets_0[s]) / src_size - 0.5) * 2.0 
+            
+            
+            if img_pyramid.dim == 3:
+               # print("start end pfield: {} {} {}".format(start_,end_,pfield))
+               # print("crop_offsets_0: {}".format(crop_offsets_0))
+               # print("crop_offsets_1: {}".format(crop_offsets_1))
+               # print("start end pfield: {}".format(start_,end_,pfield))
+                
+                gdz = tls.arange_closed(start_[0],end_[0],pfield[0])
+                gdy = tls.arange_closed(start_[1],end_[1],pfield[1])
+                gdx = tls.arange_closed(start_[2],end_[2],pfield[2])                
+                pos_grid_z, pos_grid_y, pos_grid_x = torch.meshgrid(gdx, gdy, gdz)
+            else:
+                gdy = tls.arange_closed(start_[0],end_[0],pfield[0])
+                gdx = tls.arange_closed(start_[1],end_[1],pfield[1])
+                pos_grid_y, pos_grid_x = torch.meshgrid(gdx, gdy)
+            
+            
+            diff =  crop_offsets_0[s-1] - crop_offsets_0[s]
+            patch_size = crop_offsets_1[s] - crop_offsets_0[s]
+            
+            if False:
+                crop_offset_px = torch.round(torch.tensor(pfield)*diff/patch_size)
+                
+                crop_offset_px = torch.min(crop_offset_px,torch.tensor(pfield,dtype=torch.float32)/2)
+                
+                crop_offset_px = torch.clamp(crop_offset_px,min=0)
+                crop_offset_px = torch.flip(crop_offset_px,dims=[0])
+            #batch_list.patchlist[s].offsets[batch_id,:] = torch.flip(crop_offset_px,dims=[0])
+            
+            for bl in range(len(batch_list_list)):
+               # batch_list_list[bl].patchlist[s].offsets[batch_id,:] = crop_offset_px
+              
+                
+                batch_list_list[bl].patchlist[s].grid[batch_id,...,0] =  pos_grid_x
+                batch_list_list[bl].patchlist[s].grid[batch_id,...,1] =  pos_grid_y
+                if img_pyramid.dim == 3:
+                    batch_list_list[bl].patchlist[s].grid[batch_id,...,2] =  pos_grid_z
+                    
+                  
+                    
+                  
+                    
+                  
+    @staticmethod 
+    def write_patch_static_mu(
+                    img_pyramid_list,
+                    batch_list_list,
+                    batch_id,
+                    position_mu,
+                    scale_facts,
+                    base_scale_indx=None,
+                    scale = (1,1,1),
+                    rotate=0,
+                    mode = "random",
+                    interpolation=["bilinear","nearest"],#interpolation=["bilinear","nearest"],
+                    non_linear_def_spacing=30,
+                    non_linear_def_factor=[0],
+                    scale_whitelist=[],
+                    spatial_noise=[0],
+                    intensity_noise=None,
+                    device="cpu",
+                    target_device="cpu",
+                    force_nonlin_def=False,
+                    target_element_size=None,
+                    warn_if_ooim=False,
+                    crop_bb = False,#):
+                    correct_ooim_level0=False):
+        
+        
+        def abs2rel(pos,shape):
+            return 2.0 * ((pos)/(shape-1) - 0.5) 
+        
+                    
+        #list of output batches
+        batch_list = batch_list_list[0]
+        #list of input images (usually img and label)
+        pfield = batch_list.patchlist[0].tensor.shape[2:]
+    
+        #reference img pyramid
+        #we assume all have same attributes (img sizes etc.)       
+        img_pyramid = img_pyramid_list[0]
+        
+        img_element_size_mu = tls.tt(img_pyramid.element_size,device=device)                
+        target_element_size_mu = tls.tt(target_element_size,device=device) if target_element_size is not None else img_element_size_mu
+        
+        
+        
+        
+            
+        
+        n_scales = scale_facts.shape[1]
+        scales = range(n_scales)
+
+        if base_scale_indx is None:
+            base_scale_indx = 0
+            
+            
+        t = img_pyramid.tensors[0]
+        #shape_ = torch.tensor(t.shape,device=device)
+        shape_ = tls.tt(t.shape,device=device)
+        #shape_t = shape[2:].float()
+        
+        shape_vox = shape_[2:].float()
+        shape_mu = shape_vox *  img_element_size_mu
+        pfield_size_vox = tls.tt(pfield,device=device)
+        pfield_size_mu = pfield_size_vox * target_element_size_mu#/img_element_size_mu        
+        
+        #pfield_img_voxel_space = pfield
+        #if target_element_size is not None:
+        #        pfield_img_voxel_space =  torch.tensor(pfield) * target_element_size_t/img_element_size_t
+                
+        scale_t = tls.tt(scale[:img_pyramid.dim],dtype=torch.float32,device=device)        
+        scale_facts_t  = tls.tt(scale_facts,device=device)
+        
+        position_mu = tls.tt(position_mu,device=device,dtype=torch.float32)[:img_pyramid.dim]                               
+        #position_t = tls.tt(position,device=device)[:img_pyramid.dim].float()
+        
+        bb_start = position_mu
+        bb_end = bb_start + pfield_size_mu -1.0*target_element_size_mu
+        bb_start_rel = abs2rel(bb_start,shape_mu)
+        bb_end_rel = abs2rel(bb_end,shape_mu)
+        
+        if crop_bb:
+            crop_bb_0 = tls.tt(img_pyramid.bb[0],device=device) * img_element_size_mu
+            crop_bb_1 = tls.tt(img_pyramid.bb[1],device=device) * img_element_size_mu
+            
+        
+      
+        pos_rel = abs2rel(position_mu,shape_mu)
+        
+        if correct_ooim_level0:
+            for d in range(img_pyramid.dim ):
+                correction = (bb_end_rel[d]-1).clamp(min=0)
+                bb_start_rel[d] -= correction
+                bb_end_rel[d] -= correction
+                pos_rel[d] -= correction
+        
+        grid = torch.ones((1,)+pfield+(img_pyramid.dim+1,),dtype = torch.float32,device=device)
+        grid_ = torch.zeros(grid.shape,dtype = torch.float32,device=device)
+    
+    
+        if img_pyramid.dim == 2:                      
+            dx = tls.arange_closed(bb_start_rel[0],bb_end_rel[0],pfield_size_vox[0],device=device)
+            dy = tls.arange_closed(bb_start_rel[1],bb_end_rel[1],pfield_size_vox[1],device=device)
+            
+            grid_y , grid_x = torch.meshgrid(dx, dy)
+            grid[0,...,0] = grid_x
+            grid[0,...,1] = grid_y
+            
+            trans_inv_mat = torch.tensor([[1,0,0],
+                                          [0,1,0],
+                                          [-pos_rel[1],-pos_rel[0],1]],dtype = torch.float32,device=device)
+            trans_mat = torch.tensor([[1,0,0],
+                                      [0,1,0],
+                                      [pos_rel[1],pos_rel[0],1]],dtype = torch.float32,device=device)
+
+            scale_mat = torch.tensor([[scale[1],0,0],
+                                      [0,scale[0],0],
+                                      [0,0,1]],dtype = torch.float32,device=device)
+            trafo = scale_mat
+            has_rotation = False
+            if rotate!=0:
+                has_rotation = True
+                rot_mat = torch.tensor([[math.cos(rotate),math.sin(rotate),0],[-math.sin(rotate),math.cos(rotate),0],[0,0,1]],dtype = torch.float32,device=device)
+         
+    
+            grid_bb = torch.cat((grid[None,0,0,0,:],grid[None,0,-1,-1,:]),dim=0)
+            
+        
+        if img_pyramid.dim == 3:                
+            dx = tls.arange_closed(bb_start_rel[0],bb_end_rel[0],pfield[0],device=device)
+            dy = tls.arange_closed(bb_start_rel[1],bb_end_rel[1],pfield[1],device=device)
+            dz = tls.arange_closed(bb_start_rel[2],bb_end_rel[2],pfield[2],device=device)
+
+            grid_z, grid_y , grid_x = torch.meshgrid(dx, dy, dz)
+            grid[0,...,0] = grid_x
+            grid[0,...,1] = grid_y
+            grid[0,...,2] = grid_z
+                      
+            trans_inv_mat = torch.tensor([[1,0,0,0],
+                                          [0,1,0,0],
+                                          [0,0,1,0],
+                                          [-pos_rel[2],-pos_rel[1],-pos_rel[0],1]],dtype = torch.float32,device=device)
+            trans_mat = torch.tensor([[1,0,0,0],
+                                          [0,1,0,0],
+                                          [0,0,1,0],
+                                          [pos_rel[2],pos_rel[1],pos_rel[0],1]],dtype = torch.float32,device=device)
+            
+            scale_mat = torch.tensor([[scale[2],0,0,0],
+                                      [0,scale[1],0,0],
+                                      [0,0,scale[0],0],
+                                      [0,0,0,1]],dtype = torch.float32,device=device)
+               
+            trafo = scale_mat 
+            
+            has_rotation = False
+            if isinstance(rotate, torch.Tensor):
+                has_rotation = True
+                rotate/=torch.norm(rotate)
+                qr = rotate[0]
+                qi = rotate[1]
+                qj = rotate[2]
+                qk = rotate[3]
+                
+                rot_mat = torch.tensor([[1.0-2.0*(qj**2+qk**2),2*(qi*qj+qk*qr),  2*(qi*qk-qj*qr),  0],
+                                          [2*(qi*qj-qk*qr),     1-2*(qi**2+qk**2),2*(qj*qk+qi*qr),  0],
+                                          [2*(qi*qk+qj*qr),     2*(qj*qk-qi*qr),  1-2*(qi**2+qj**2),0],
+                                          [0,0,0,1]],dtype = torch.float32,device=device)
+                print(rot_mat)
+                print(rot_mat.det())
+        
+            grid_bb = torch.cat((grid[None,0,0,0,0,:],grid[None,0,-1,-1,-1,:]),dim=0)
+            
+       
+        
+
+        if img_pyramid.dim == 2:
+            bb_img_0 = torch.tensor([-1.0,-1.0],device=device) 
+            bb_img_1 = torch.tensor([1.0,1.0],device=device)  
+        else:
+            bb_img_0 = torch.tensor([-1.0,-1.0,-1.0],device=device) 
+            bb_img_1 = torch.tensor([1.0,1.0,1.0],device=device)  
+
+        if crop_bb:
+            bb_img_0 = abs2rel(tls.tt(crop_bb_0.to(device=device)),shape_mu).flip(dims=(0,))#.to(device=device)
+            bb_img_1 = abs2rel(tls.tt(crop_bb_1.to(device=device)),shape_mu).flip(dims=(0,))
+            
+        shifts_ = patchwriter.pyramidal_shifts(
+            base_scale_indx,
+            scale_facts,
+            img_pyramid,
+            trans_mat,
+            trans_inv_mat,
+            scale_mat,#trafo,#scale_mat,#,
+            grid_bb,
+            scale,
+            bb_img_0,
+            bb_img_1,
+            mode = mode,device=device,#"deterministic"                
+            )
+
+
+        if any(non_linear_def_factor) or force_nonlin_def:
+            img_element_size = None
+            if target_element_size is not None:
+                img_element_size = img_pyramid.element_size
+            
+            noise_grid = patchwriter.non_linear_def(shape=shape_vox,
+                                        spacing=non_linear_def_spacing,
+                                        img_element_size=img_element_size,
+                                        factor=non_linear_def_factor,device=device)
+     
+        ref_pos = torch.zeros([img_pyramid.dim],device=device)
+        
+        
+        crop_offsets_0 = {}
+        crop_offsets_1 = {}
+        init = True  
+        
+        #make sure base scale image comes first
+        for s in [base_scale_indx]+list(reversed(scales)) :
+            if s < base_scale_indx:
+                continue
+            if s == base_scale_indx:
+                if not init:
+                    continue      
+                
+            if len(scale_whitelist) > 0 and not (s in scale_whitelist):
+                continue
+    
+            if img_pyramid.dim == 2:
+                res_mat = torch.tensor([[scale_facts[1,s],0,0],[0,scale_facts[0,s],0],[0,0,1]],dtype = torch.float32,device=device)
+            else:
+                res_mat = torch.tensor([[scale_facts[2,s],0,0,0],
+                                                [0,scale_facts[1,s],0,0],
+                                                [0,0,scale_facts[0,s],0],
+                                                [0,0,0,1]],dtype = torch.float32,device=device)
+            
+            if init:
+                init = False            
+            
+            mat = torch.mm(trans_inv_mat,res_mat)
+            mat=torch.mm(mat,trafo)
+            mat = torch.mm(mat,trans_mat)
+            
+            if img_pyramid.dim == 2:
+                grid_bb = torch.cat((grid[None,0,0,0,:],grid[None,0,-1,-1,:]),dim=0).clone()
+            else:
+                grid_bb = torch.cat((grid[None,0,0,0,0,:],grid[None,0,-1,-1,-1,:]),dim=0).clone()
+                
+          
+            grid_bb = torch.matmul(grid_bb,mat)
+                
+            if has_rotation:
+                center_ = (grid_bb[1,:] - grid_bb[0,:]) / 2.0 + grid_bb[0,:]
+                center_[img_pyramid.dim] = 1
+            
+                if img_pyramid.dim==2:
+                    trans_inv_mat_rot = torch.tensor([[1,0,0],
+                                              [0,1,0],
+                                              [-center_[0],-center_[1],1]],dtype = torch.float32)
+                    trans_mat_rot = torch.tensor([[1,0,0],
+                                              [0,1,0],
+                                              [center_[0],center_[1],1]],dtype = torch.float32)
+                else:
+                    trans_inv_mat_rot = torch.tensor([[1,0,0,0],
+                                              [0,1,0,0],
+                                              [0,0,1,0],
+                                              [-center_[0],-center_[1],-center_[2],1]],dtype = torch.float32)
+                    trans_mat_rot = torch.tensor([[1,0,0,0],
+                                              [0,1,0,0],
+                                              [0,0,1,0],
+                                              [center_[0],center_[1],center_[2],1]],dtype = torch.float32)
+                    
+               
+                grid_bb[...,:img_pyramid.dim] += shifts_[s] 
+                if img_pyramid.dim==2:
+                    shifts_m = torch.tensor([[1,0,0],
+                                              [0,1,0],
+                                              [shifts_[s][0],shifts_[s][1],1]],dtype = torch.float32,device=device)
+                else:
+                    shifts_m =torch.tensor([[1,0,0,0],
+                                          [0,1,0,0],
+                                          [0,0,1,0],
+                                          [shifts_[s][0],shifts_[s][1],shifts_[s][2],1]],dtype = torch.float32,device=device)
+              
+                mat = torch.mm(mat,shifts_m)
+    
+                mat = torch.mm(mat,trans_inv_mat_rot)
+                mat = torch.mm(mat,rot_mat)
+                mat = torch.mm(mat,trans_mat_rot)
+                grid_ = torch.matmul(grid,mat)
+                
+            else:
+                grid_ = torch.matmul(grid,mat)
+                grid_bb[...,:img_pyramid.dim] += shifts_[s] 
+                grid_[...,:img_pyramid.dim] += shifts_[s] 
+            
+            
+            grid_0 = grid_bb[0,:img_pyramid.dim]
+            grid_1 = grid_bb[1,:img_pyramid.dim]
+              
+            if warn_if_ooim  and (torch.any(grid_0<-1.001) or torch.any(grid_1>1.001)):
+                print("#W initial point ooim: {}".format(s))
+                print("#W grid_0: {}".format(grid_0))
+                print("#W grid_0 < -1: {}".format(grid_0<-1))
+                print("#W grid_1: {}".format(grid_1))         
+                print("#W grid_1 > 1: {}".format(grid_1>1))   
+                print("#W impos 0: {}".format((shape_vox)*(grid_0.flip(dims=(0,))/2.0+0.5)))
+                print("#W impos 1: {}".format((shape_vox-1)*(grid_1.flip(dims=(0,))/2.0+0.5)))
+                print("#W shape : {}".format(shape_vox))
+                
+            
+            offset = torch.zeros(img_pyramid.dim)                
+            
+            crop_offsets_0[s] = grid_0.clone().to(device="cpu")
+            crop_offsets_1[s] = grid_1.clone().to(device="cpu")
+      
+    
+      
+            if any(non_linear_def_factor) or force_nonlin_def:
+                noise_grid_s =  torch.nn.functional.grid_sample(noise_grid, 
+                                                        grid_[...,:img_pyramid.dim], 
+                                                        mode="bilinear", 
+                                                        padding_mode='zeros', 
+                                                        align_corners=True)
+           
+                grid_[0,...,0] += noise_grid_s[0,0,...]
+                grid_[0,...,1] += noise_grid_s[0,1,...]
+                if img_pyramid.dim == 3:
+                    grid_[0,...,2] += noise_grid_s[0,2,...]
+                    
+                
+                    
+            if any(spatial_noise):# > 0:
+                    d_xyz = torch.tensor(spatial_noise,dtype=torch.float32).flip(dims=(0,))/torch.tensor(grid_.shape[1:5],dtype=torch.float32)
+                    grid_ += d_xyz * torch.randn(grid_.shape,device=device) 
+                    print("")                    
+                
+            
+            #grid_cpu = grid_.noise_grid.clamp(min=-1.0,max=1.0).to(device=target_device)
+            grid_cpu = grid_.to(device=target_device)
+            
+            for bl in range(len(batch_list_list)):
+                avaliable_scales = len(img_pyramid_list[bl].tensors)
+                #best_img = min(max(0,round(s*np.min(scale))),max(scales)) 
+                best_img = min(max(0,round(s*np.min(scale))),avaliable_scales-1) 
+                
+                t_s = img_pyramid_list[bl].tensors[best_img]
+                
+               # if warn_if_ooim and torch.any(grid_>1.001) or torch.any(grid_<-1.001):
+               #     print("#W: ooim warning")
+    
+                patch = torch.nn.functional.grid_sample(t_s, 
+                                                        grid_cpu[...,:img_pyramid.dim], 
+                                                        mode=interpolation[bl] if isinstance(interpolation,list)  else interpolation, 
+                                                        padding_mode='zeros', 
+                                                        align_corners=True)
+                
+                if intensity_noise is not None:
+                    if intensity_noise[bl] > 0.00000001:
+                        patch = torch.clamp(patch  *(1+intensity_noise[bl] * torch.randn(patch.shape)),min=0) 
+
+                
+                batch_list_list[bl].patchlist[s].tensor[batch_id,...] = patch
+                
+                batch_list_list[bl].patchlist[s].rel_coordinates[batch_id,:] = grid_cpu[...,:img_pyramid.dim]
+                
+                batch_list_list[bl].patchlist[s].offset_rel[batch_id,:] =  crop_offsets_0[s]
+                
+    
+
+        for s in range(1+base_scale_indx,max(scales)+1):   
+            
+            if len(scale_whitelist) > 0 and not ((s in scale_whitelist) and ((s-1) in scale_whitelist)):
+                #print("skipping scale {}".format(s))
+                continue
+            
+            src_size = crop_offsets_1[s] - crop_offsets_0[s]            
+            start_ = ((crop_offsets_0[s-1] - crop_offsets_0[s]) / src_size - 0.5) * 2.0 
+            end_ = ((crop_offsets_1[s-1] - crop_offsets_0[s]) / src_size - 0.5) * 2.0 
+            
+            
+            if img_pyramid.dim == 3:
+                gdz = tls.arange_closed(start_[0],end_[0],pfield[0])
+                gdy = tls.arange_closed(start_[1],end_[1],pfield[1])
+                gdx = tls.arange_closed(start_[2],end_[2],pfield[2])                
+                pos_grid_z, pos_grid_y, pos_grid_x = torch.meshgrid(gdx, gdy, gdz)
+            else:
+                gdy = tls.arange_closed(start_[0],end_[0],pfield[0])
+                gdx = tls.arange_closed(start_[1],end_[1],pfield[1])
+                pos_grid_y, pos_grid_x = torch.meshgrid(gdx, gdy)
+            
+            
+            #diff =  crop_offsets_0[s-1] - crop_offsets_0[s]
+            #patch_size = crop_offsets_1[s] - crop_offsets_0[s]
+            
+           
+            
+            for bl in range(len(batch_list_list)):
+                batch_list_list[bl].patchlist[s].grid[batch_id,...,0] =  pos_grid_x
+                batch_list_list[bl].patchlist[s].grid[batch_id,...,1] =  pos_grid_y
+                if img_pyramid.dim == 3:
+                    batch_list_list[bl].patchlist[s].grid[batch_id,...,2] =  pos_grid_z
